@@ -200,3 +200,5 @@ cython_debug/
 #.idea/
 
 backend/.langgraph_api
+jovial-idiom-461802-k1-c58dbc09ca21.json
+batch_sdk.py

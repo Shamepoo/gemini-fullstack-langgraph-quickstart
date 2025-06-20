@@ -7,7 +7,6 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
 
 from agent.state import (
     OverallState,
@@ -23,7 +22,7 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_vertexai import ChatVertexAI
 from agent.utils import (
     get_citations,
     get_research_topic,
@@ -32,12 +31,6 @@ from agent.utils import (
 )
 
 load_dotenv()
-
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
-
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
 # Nodes
@@ -54,18 +47,20 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     Returns:
         Dictionary with state update, including search_query key containing the generated queries
     """
+
     configurable = Configuration.from_runnable_config(config)
 
     # check for custom initial search query count
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
+    # init Gemini 2.0 Flash via Vertex AI
+    llm = ChatVertexAI(
         model=configurable.query_generator_model,
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"),
+        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
     )
     structured_llm = llm.with_structured_output(SearchQueryList)
 
@@ -95,7 +90,7 @@ def continue_to_web_research(state: QueryGenerationState):
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     """LangGraph node that performs web research using the native Google Search API tool.
 
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
+    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash via Vertex AI.
 
     Args:
         state: Current graph state containing the search query and research loop count
@@ -111,23 +106,95 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         research_topic=state["search_query"],
     )
 
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
+    # Use ChatVertexAI with Google Search tool
+    llm = ChatVertexAI(
         model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
+        temperature=0,
+        max_retries=2,
+        location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"),
+        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
     )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+
+    # Bind Google Search tool to the model
+    search_tool = {"google_search": {}}
+    llm_with_search = llm.bind_tools([search_tool])
+
+    # Invoke the model with search capabilities
+    response = llm_with_search.invoke(formatted_prompt)
+
+    # For ChatVertexAI, we need to access the response metadata differently
+    # The grounding metadata should be available in response.response_metadata
+    if (
+        hasattr(response, "response_metadata")
+        and "grounding_metadata" in response.response_metadata
+        and response.response_metadata["grounding_metadata"]
+        and "grounding_chunks" in response.response_metadata["grounding_metadata"]
+    ):
+
+        grounding_chunks = response.response_metadata["grounding_metadata"][
+            "grounding_chunks"
+        ]
+        grounding_supports = response.response_metadata["grounding_metadata"].get(
+            "grounding_supports", []
+        )
+
+        # Create a mock response object similar to genai_client response for compatibility with existing utils
+        class MockCandidate:
+            def __init__(self, grounding_metadata):
+                self.grounding_metadata = grounding_metadata
+
+        class MockGroundingMetadata:
+            def __init__(self, chunks, supports):
+                self.grounding_chunks = chunks
+                self.grounding_supports = supports
+
+        class MockGroundingChunk:
+            def __init__(self, chunk_data):
+                self.web = MockWeb(chunk_data.get("web", {}))
+
+        class MockWeb:
+            def __init__(self, web_data):
+                self.uri = web_data.get("uri", "")
+                self.title = web_data.get("title", "")
+
+        class MockGroundingSupport:
+            def __init__(self, support_data):
+                self.segment = MockSegment(support_data.get("segment", {}))
+                self.grounding_chunk_indices = support_data.get(
+                    "grounding_chunk_indices", []
+                )
+
+        class MockSegment:
+            def __init__(self, segment_data):
+                self.start_index = segment_data.get("start_index")
+                self.end_index = segment_data.get("end_index")
+
+        class MockResponse:
+            def __init__(self, text, grounding_metadata):
+                self.text = text
+                self.candidates = [MockCandidate(grounding_metadata)]
+
+        # Convert the response format to match the expected structure
+        mock_chunks = [MockGroundingChunk(chunk) for chunk in grounding_chunks]
+        mock_supports = [
+            MockGroundingSupport(support) for support in grounding_supports
+        ]
+        mock_grounding_metadata = MockGroundingMetadata(mock_chunks, mock_supports)
+        mock_response = MockResponse(response.content, mock_grounding_metadata)
+
+        # Resolve the urls to short urls for saving tokens and time (using mock chunks)
+        resolved_urls = resolve_urls(mock_chunks, state["id"])
+
+        # Gets the citations and adds them to the generated text
+        citations = get_citations(mock_response, resolved_urls)
+        modified_text = insert_citation_markers(response.content, citations)
+        sources_gathered = [
+            item for citation in citations for item in citation["segments"]
+        ]
+    else:
+        # Fallback if no grounding metadata is available
+        modified_text = response.content
+        sources_gathered = []
 
     return {
         "sources_gathered": sources_gathered,
@@ -162,12 +229,13 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         research_topic=get_research_topic(state["messages"]),
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
-    # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
+    # init Reasoning Model via Vertex AI
+    llm = ChatVertexAI(
         model=reasoning_model,
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"),
+        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
     )
     result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
@@ -241,12 +309,13 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
+    # init Reasoning Model via Vertex AI, default to Gemini 2.5 Flash
+    llm = ChatVertexAI(
         model=reasoning_model,
         temperature=0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"),
+        project=os.getenv("GOOGLE_CLOUD_PROJECT"),
     )
     result = llm.invoke(formatted_prompt)
 

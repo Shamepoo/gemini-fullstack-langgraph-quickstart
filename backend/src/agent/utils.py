@@ -25,12 +25,27 @@ def resolve_urls(urls_to_resolve: List[Any], id: int) -> Dict[str, str]:
     Ensures each original URL gets a consistent shortened form while maintaining uniqueness.
     """
     prefix = f"https://vertexaisearch.cloud.google.com/id/"
-    urls = [site.web.uri for site in urls_to_resolve]
+
+    # Handle both dict and object formats for compatibility
+    urls = []
+    for site in urls_to_resolve:
+        if isinstance(site, dict):
+            # Handle dict format from ChatVertexAI
+            web_data = site.get("web", {})
+            uri = web_data.get("uri", "")
+        else:
+            # Handle object format from genai_client
+            uri = (
+                site.web.uri
+                if hasattr(site, "web") and hasattr(site.web, "uri")
+                else ""
+            )
+        urls.append(uri)
 
     # Create a dictionary that maps each unique URL to its first occurrence index
     resolved_map = {}
     for idx, url in enumerate(urls):
-        if url not in resolved_map:
+        if url and url not in resolved_map:
             resolved_map[url] = f"{prefix}{id}-{idx}"
 
     return resolved_map
@@ -149,14 +164,69 @@ def get_citations(response, resolved_urls_map):
             for ind in support.grounding_chunk_indices:
                 try:
                     chunk = candidate.grounding_metadata.grounding_chunks[ind]
-                    resolved_url = resolved_urls_map.get(chunk.web.uri, None)
-                    citation["segments"].append(
-                        {
-                            "label": chunk.web.title.split(".")[:-1][0],
-                            "short_url": resolved_url,
-                            "value": chunk.web.uri,
-                        }
-                    )
+
+                    # Handle both dict and object formats for compatibility
+                    if isinstance(chunk, dict):
+                        # Handle dict format from ChatVertexAI
+                        web_data = chunk.get("web", {})
+                        uri = web_data.get("uri", "")
+                        title = web_data.get("title", "")
+                    else:
+                        # Handle object format from genai_client or mock objects
+                        try:
+                            uri = (
+                                chunk.web.uri
+                                if hasattr(chunk, "web") and hasattr(chunk.web, "uri")
+                                else ""
+                            )
+                            title = (
+                                chunk.web.title
+                                if hasattr(chunk, "web") and hasattr(chunk.web, "title")
+                                else ""
+                            )
+                        except AttributeError:
+                            # If chunk.web fails, treat as if it's a dict
+                            if hasattr(chunk, "__dict__"):
+                                chunk_dict = chunk.__dict__
+                            else:
+                                chunk_dict = chunk
+                            web_data = (
+                                chunk_dict.get("web", {})
+                                if isinstance(chunk_dict, dict)
+                                else {}
+                            )
+                            uri = (
+                                web_data.get("uri", "")
+                                if isinstance(web_data, dict)
+                                else ""
+                            )
+                            title = (
+                                web_data.get("title", "")
+                                if isinstance(web_data, dict)
+                                else ""
+                            )
+
+                    if uri:  # Only add if we have a valid URI
+                        resolved_url = resolved_urls_map.get(uri, None)
+                        # Process title safely
+                        label = "Source"  # Default fallback
+                        if title:
+                            try:
+                                parts = title.split(".")
+                                if len(parts) > 1:
+                                    label = parts[0]
+                                else:
+                                    label = title
+                            except:
+                                label = "Source"
+
+                        citation["segments"].append(
+                            {
+                                "label": label,
+                                "short_url": resolved_url,
+                                "value": uri,
+                            }
+                        )
                 except (IndexError, AttributeError, NameError):
                     # Handle cases where chunk, web, uri, or resolved_map might be problematic
                     # For simplicity, we'll just skip adding this particular segment link
